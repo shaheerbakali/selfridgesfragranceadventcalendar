@@ -1,13 +1,17 @@
-name: Check Selfridges Advent Calendar Stock
+name: Check Selfridges FRAGRANCE Advent Calendar
 
 on:
   schedule:
-    # Runs every 15 minutes
+    # Baseline: every 15 minutes, all the time
     - cron: "*/15 * * * *"
+    # Tightened window: every 5 minutes, 28-30 September
+    - cron: "*/5 * 28-30 9 *"
+    # Tightened window: every 5 minutes, 1-5 October
+    - cron: "*/5 * 1-5 10 *"
   workflow_dispatch: {}
 
 jobs:
-  check-stock:
+  check-fragrance:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -24,20 +28,20 @@ jobs:
       - name: Restore last known state
         uses: actions/cache@v4
         with:
-          path: last_state.txt
-          key: selfridges-state-${{ github.run_id }}
+          path: fragrance_state.txt
+          key: fragrance-state-${{ github.run_id }}
           restore-keys: |
-            selfridges-state-
+            fragrance-state-
 
-      - name: Run stock check
+      - name: Run fragrance check
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python check_stock.py
+        run: python check_fragrance.py
 
       - name: Save state
         uses: actions/cache/save@v4
         if: always()
         with:
-          path: last_state.txt
-          key: selfridges-state-${{ github.run_id }}
+          path: fragrance_state.txt
+          key: fragrance-state-${{ github.run_id }}
