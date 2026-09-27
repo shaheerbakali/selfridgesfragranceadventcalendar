@@ -1,0 +1,52 @@
+name: Check Selfridges FRAGRANCE Advent Calendar
+
+on:
+  schedule:
+    # Baseline: every 15 minutes, all the time (in case it launches early or late)
+    - cron: "*/15 * * * *"
+
+    # LAUNCH DAY: confirmed 8 October (UK time). The UK is on BST (UTC+1) on
+    # that date, so "8 Oct 00:00-23:59 UK time" = 7 Oct 23:00 UTC through
+    # 8 Oct 22:59 UTC. These entries cover that window every 2 minutes, with
+    # an extra hour of buffer on each side in case of early/late release.
+    - cron: "*/2 23 7 10 *"      # 7 Oct 23:00-23:59 UTC (buffer before UK midnight)
+    - cron: "*/2 0-23 8 10 *"    # 8 Oct, full day UTC (covers all of UK 8 Oct)
+    - cron: "*/2 0 9 10 *"       # 9 Oct 00:00-00:59 UTC (buffer after UK midnight)
+
+  workflow_dispatch: {}
+
+jobs:
+  check-fragrance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore last known state
+        uses: actions/cache@v4
+        with:
+          path: fragrance_state.txt
+          key: fragrance-state-${{ github.run_id }}
+          restore-keys: |
+            fragrance-state-
+
+      - name: Run fragrance check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python check_fragrance.py
+
+      - name: Save state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: fragrance_state.txt
+          key: fragrance-state-${{ github.run_id }}
