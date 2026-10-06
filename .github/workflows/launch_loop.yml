@@ -1,0 +1,61 @@
+name: Fragrance Launch Loop (8 Oct)
+
+on:
+  schedule:
+    # Each run loops for ~5h50m, checking every ~25s. They are queued back-to-back
+    # by the concurrency group below, giving continuous coverage from
+    # 7 Oct 22:07 UTC (23:07 UK) to roughly 9 Oct morning.
+    # Odd minute (:07) on purpose - GitHub delays cron jobs at :00.
+    - cron: "7 22 7 10 *"
+    - cron: "7 3 8 10 *"
+    - cron: "7 8 8 10 *"
+    - cron: "7 13 8 10 *"
+    - cron: "7 18 8 10 *"
+    - cron: "7 23 8 10 *"
+  workflow_dispatch:
+    inputs:
+      loop_minutes:
+        description: "How many minutes to keep checking (max 350). Use 2 for a quick test."
+        default: "350"
+
+concurrency:
+  group: fragrance-launch-loop
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore last known state
+        uses: actions/cache/restore@v4
+        with:
+          path: fragrance_state.json
+          key: fragrance-loop-${{ github.run_id }}
+          restore-keys: |
+            fragrance-loop-
+
+      - name: Watch for queue / product launch
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOOP_MINUTES: ${{ inputs.loop_minutes || '350' }}
+        run: python check_fragrance.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fragrance_state.json
+          key: fragrance-loop-${{ github.run_id }}
