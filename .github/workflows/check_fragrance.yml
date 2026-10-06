@@ -2,22 +2,24 @@ name: Check Selfridges FRAGRANCE Advent Calendar
 
 on:
   schedule:
-    # Baseline: every 15 minutes, all the time (in case it launches early or late)
+    # Baseline safety net: one check every 15 minutes, all the time.
+    # (GitHub's real minimum for cron is 5 minutes and runs can be delayed, so the
+    # launch-day second-by-second watching is handled by launch_loop.yml instead.)
     - cron: "*/15 * * * *"
-
-    # LAUNCH DAY: confirmed 8 October (UK time). The UK is on BST (UTC+1) on
-    # that date, so "8 Oct 00:00-23:59 UK time" = 7 Oct 23:00 UTC through
-    # 8 Oct 22:59 UTC. These entries cover that window every 2 minutes, with
-    # an extra hour of buffer on each side in case of early/late release.
-    - cron: "*/2 23 7 10 *"      # 7 Oct 23:00-23:59 UTC (buffer before UK midnight)
-    - cron: "*/2 0-23 8 10 *"    # 8 Oct, full day UTC (covers all of UK 8 Oct)
-    - cron: "*/2 0 9 10 *"       # 9 Oct 00:00-00:59 UTC (buffer after UK midnight)
-
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      send_test:
+        description: "Send a test Telegram message to confirm alerts work?"
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
 
 jobs:
-  check-fragrance:
+  check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -31,22 +33,24 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Restore last known state
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          path: fragrance_state.txt
-          key: fragrance-state-${{ github.run_id }}
+          path: fragrance_state.json
+          key: fragrance-state-v3-${{ github.run_id }}
           restore-keys: |
-            fragrance-state-
+            fragrance-state-v3-
 
       - name: Run fragrance check
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEND_TEST: ${{ inputs.send_test || 'false' }}
+          LOOP_MINUTES: "0"
         run: python check_fragrance.py
 
       - name: Save state
-        uses: actions/cache/save@v4
         if: always()
+        uses: actions/cache/save@v4
         with:
-          path: fragrance_state.txt
-          key: fragrance-state-${{ github.run_id }}
+          path: fragrance_state.json
+          key: fragrance-state-v3-${{ github.run_id }}
