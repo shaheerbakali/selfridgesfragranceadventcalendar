@@ -46,6 +46,9 @@ HEADERS = {
 REDIRECT_CODES = (301, 302, 303, 307, 308)
 PRE_QUEUE_MARKERS = ("will open", "opens on", "opening on", "not open yet", "not yet open")
 OUT_OF_STOCK_MARKERS = ("out of stock", "currently unavailable")
+# The "sold out but a restock is coming" banner seen after the queue let people
+# through but the calendar had already sold out (your 8 Oct experience).
+RESTOCK_PENDING_MARKERS = ("now unavailable", "more stock coming soon")
 # "Add to bag" that is NOT the Selfridges+ subscription button ("Add to bag - £10.00")
 ADD_TO_BAG_RE = re.compile(r"add to (?:bag|basket)(?!\s*[-\u2013\u2014]\s*[£$€])")
 
@@ -111,6 +114,8 @@ def product_is_purchasable(html):
     lower = html.lower()
     if any(m in lower for m in OUT_OF_STOCK_MARKERS):
         return False
+    if any(m in lower for m in RESTOCK_PENDING_MARKERS):
+        return False
     return bool(ADD_TO_BAG_RE.search(lower))
 
 
@@ -124,8 +129,11 @@ def probe():
         "queue_valid": False,
         "queue_pre": False,
         "queue_hash": None,
+        "restock_pending": False,
         "note": "",
     }
+    product_html = None
+    queue_html = None
     queue_target = None
     try:
         r = get(PRODUCT_URL, follow=False)
@@ -143,27 +151,34 @@ def probe():
             queue_target = loc
         elif status == 200:
             info["ok"] = True
-            if product_is_purchasable(r.text):
+            product_html = r.text
+            if product_is_purchasable(product_html):
                 info["product_live"] = True
-                return info
         else:
             info["note"] = f"product page status {status}"
     except Exception as exc:
         info["note"] = f"product fetch error: {type(exc).__name__}"
 
-    try:
-        q = get(queue_target or QUEUE_URL, follow=True)
-        info["queue_status"] = q.status_code
-        if q.status_code == 200:
-            info["ok"] = True
-            lower = q.text.lower()
-            info["queue_valid"] = ("queue-it" in lower) or ("queueit" in lower)
-            info["queue_pre"] = any(m in lower for m in PRE_QUEUE_MARKERS)
-            info["queue_hash"] = fingerprint(q.text)
-        else:
-            info["note"] = (info["note"] + f" queue status {q.status_code}").strip()
-    except Exception as exc:
-        info["note"] = (info["note"] + f" queue fetch error: {type(exc).__name__}").strip()
+    if not info["product_live"]:
+        try:
+            q = get(queue_target or QUEUE_URL, follow=True)
+            info["queue_status"] = q.status_code
+            if q.status_code == 200:
+                info["ok"] = True
+                queue_html = q.text
+                lower = queue_html.lower()
+                info["queue_valid"] = ("queue-it" in lower) or ("queueit" in lower)
+                info["queue_pre"] = any(m in lower for m in PRE_QUEUE_MARKERS)
+                info["queue_hash"] = fingerprint(queue_html)
+            else:
+                info["note"] = (info["note"] + f" queue status {q.status_code}").strip()
+        except Exception as exc:
+            info["note"] = (
+                info["note"] + f" queue fetch error: {type(exc).__name__}"
+            ).strip()
+
+    combined = " ".join(h.lower() for h in (product_html, queue_html) if h)
+    info["restock_pending"] = any(m in combined for m in RESTOCK_PENDING_MARKERS)
     return info
 
 
@@ -180,6 +195,17 @@ def calibrate(state, info):
 def classify(info, state):
     if info["product_live"]:
         return "PRODUCT_LIVE"
+    # Restock: we've previously seen the "unavailable, more stock coming soon"
+    # banner, and now it's gone with the page loading normally (not stuck in
+    # queue) - that's the moment to pounce, even if "Add to bag" text itself
+    # hasn't been matched yet (page layouts can vary at the exact restock instant).
+    if (
+        state.get("restock_ever_seen")
+        and not info["restock_pending"]
+        and info["ok"]
+        and not info["to_queue"]
+    ):
+        return "RESTOCKED"
     if info["queue_valid"]:
         mode = state.get("mode")
         if mode == "marker" and not info["queue_pre"]:
@@ -191,7 +217,7 @@ def classify(info, state):
 
 def track_problems(state, info):
     unreadable = (not info["ok"]) or (
-        not info["queue_valid"] and not info["product_live"]
+        not info["queue_valid"] and not info["product_live"] and not info["restock_pending"]
     )
     if not unreadable:
         state["problems_in_row"] = 0
@@ -219,6 +245,14 @@ MESSAGES = {
         "🛒🌸 THE FRAGRANCE HAUL IS ON SALE (no queue detected)!\n\n"
         f"Buy now: {PRODUCT_URL}"
     ),
+    "RESTOCKED": (
+        "🔥🌸 STOCK MIGHT BE BACK on The Fragrance Haul! 🔥\n\n"
+        "The 'more stock coming soon' notice has disappeared.\n\n"
+        f"Go now: {PRODUCT_URL}\n"
+        f"Queue link: {QUEUE_URL}\n\n"
+        "Move fast - it may sell out again in minutes, and this is a looser "
+        "signal than the others so double-check it's real when you click through."
+    ),
 }
 
 
@@ -235,10 +269,17 @@ def maybe_send_armed(state, info):
             "I couldn't see the 'will open' text in the raw page, so I'm watching for ANY "
             "change to the queue page instead (less precise, could occasionally false-alarm)."
         )
+    restock_note = (
+        "It's currently showing the 'more stock coming soon' sold-out banner - "
+        "I'll alert you the moment that clears too."
+        if info["restock_pending"]
+        else "No sold-out banner detected right now."
+    )
     send_telegram(
         "👀 Fragrance Haul watcher armed.\n"
         f"Product page redirects to queue: {'yes' if info['to_queue'] else 'no'}\n"
         f"{detail}\n"
+        f"{restock_note}\n"
         "Checking roughly every 25 seconds."
     )
     state["armed_sent"] = True
@@ -246,6 +287,7 @@ def maybe_send_armed(state, info):
 
 def run_once(state, loop_mode):
     info = probe()
+    state["restock_ever_seen"] = state.get("restock_ever_seen", False) or info["restock_pending"]
     track_problems(state, info)
     calibrate(state, info)
     if loop_mode:
@@ -269,7 +311,8 @@ def run_once(state, loop_mode):
         f"[{now_iso()}] state={result} mode={state.get('mode')} "
         f"product={info['product_status']} to_queue={info['to_queue']} "
         f"queue={info['queue_status']} valid={info['queue_valid']} "
-        f"pre={info['queue_pre']} note={info['note']!r}"
+        f"pre={info['queue_pre']} restock_pending={info['restock_pending']} "
+        f"restock_ever_seen={state.get('restock_ever_seen')} note={info['note']!r}"
     )
 
     if result != "WAITING" and result not in state["alerted"]:
