@@ -54,6 +54,12 @@ ADD_TO_BAG_RE = re.compile(r"add to (?:bag|basket)(?!\s*[-\u2013\u2014]\s*[£$�
 
 PROBLEM_THRESHOLD = 20  # consecutive unreadable checks before warning you
 
+# Tuned for the "flashing in and out of stock for a few seconds" phase.
+CONFIRM_DELAY_SECONDS = 1.5
+LOOP_INTERVAL_MIN = 5
+LOOP_INTERVAL_MAX = 10
+REMINDER_DELAY_SECONDS = 20
+
 
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -280,7 +286,8 @@ def maybe_send_armed(state, info):
         f"Product page redirects to queue: {'yes' if info['to_queue'] else 'no'}\n"
         f"{detail}\n"
         f"{restock_note}\n"
-        "Checking roughly every 25 seconds."
+        f"Checking roughly every {LOOP_INTERVAL_MIN}-{LOOP_INTERVAL_MAX} seconds "
+        "(tightened for the flash-restock phase)."
     )
     state["armed_sent"] = True
 
@@ -295,8 +302,11 @@ def run_once(state, loop_mode):
 
     result = classify(info, state)
     if result != "WAITING":
-        # confirm with a second probe a few seconds later to avoid one-off glitches
-        time.sleep(4)
+        # Confirm with a second probe shortly after, to avoid one-off render
+        # glitches. Kept short (not 0) because stock has been flashing in and
+        # out for seconds at a time - every second here is a second less to
+        # react, but an unconfirmed false alarm wastes a reaction too.
+        time.sleep(CONFIRM_DELAY_SECONDS)
         info2 = probe()
         result2 = classify(info2, state)
         noisy = (
@@ -321,7 +331,7 @@ def run_once(state, loop_mode):
         save_state(state)
         if loop_mode:
             for i in (1, 2):
-                time.sleep(45)
+                time.sleep(REMINDER_DELAY_SECONDS)
                 send_telegram(f"🔔 Reminder {i}/2: {MESSAGES[result]}")
     return result
 
@@ -348,9 +358,9 @@ def main():
     while True:
         run_once(state, loop_mode=True)
         save_state(state)
-        if time.time() + 30 >= end:
+        if time.time() + 15 >= end:
             break
-        time.sleep(random.uniform(18, 33))
+        time.sleep(random.uniform(LOOP_INTERVAL_MIN, LOOP_INTERVAL_MAX))
 
 
 if __name__ == "__main__":
