@@ -1,21 +1,25 @@
 """Selfridges 'The Fragrance Haul' advent calendar watcher (Queue-it aware).
 
-Flow on launch day:
-  product URL -> (Cloudflare edge) -> Queue-it waiting room -> product page
+Flow:
+  product URL -> (sometimes) Queue-it waiting room -> product page
+  product page can also show "Out of stock" / "more stock coming soon"
 
-We notify on Telegram when either:
+We notify on Telegram when any of these happen:
   * QUEUE_OPEN   - the Queue-it page stops saying "queue will open ..."
-  * PRODUCT_LIVE - the product page itself loads with a real "Add to bag"
+  * RESTOCKED    - the "more stock coming soon" banner clears (seen it before, now gone)
+  * PRODUCT_LIVE - the product page loads with a real, clickable "Add to bag"
 
-Modes (env vars):
-  LOOP_MINUTES  >0  -> keep checking every ~25s for that many minutes
-                0   -> single check (used by the 15-minute baseline workflow)
+This is the SUSTAINED watcher: checks every 5 minutes (GitHub Actions' real
+minimum), running continuously for a 3-week window from first deploy. It is
+NOT meant to win a sub-minute flash-restock race - nothing legitimate can.
+It IS meant to reliably catch a real batch restock that stays up for minutes,
+which is what multi-restock products (like the beauty calendar) typically do.
+
+Env vars:
   SEND_TEST=true    -> send a test Telegram message first
 """
-import hashlib
 import json
 import os
-import random
 import re
 import sys
 import time
@@ -30,8 +34,10 @@ PRODUCT_URL = (
     "https://www.selfridges.com/GB/en/product/"
     "selfridges-fragrance-advent-calendar-2026-worth-1416_R04697805/"
 )
-# Clean queue URL (no personal enqueue token - those are per-visitor and expire in minutes).
 QUEUE_URL = "https://selfridges.queue-it.net/?c=selfridges&e=fragrancecalendar"
+
+# 3-week watch window. Edit this line to extend it.
+WATCH_UNTIL = datetime(2026, 10, 29, 0, 0, 0, tzinfo=timezone.utc)
 
 STATE_FILE = "fragrance_state.json"
 
@@ -46,19 +52,12 @@ HEADERS = {
 REDIRECT_CODES = (301, 302, 303, 307, 308)
 PRE_QUEUE_MARKERS = ("will open", "opens on", "opening on", "not open yet", "not yet open")
 OUT_OF_STOCK_MARKERS = ("out of stock", "currently unavailable")
-# The "sold out but a restock is coming" banner seen after the queue let people
-# through but the calendar had already sold out (your 8 Oct experience).
 RESTOCK_PENDING_MARKERS = ("now unavailable", "more stock coming soon")
 # "Add to bag" that is NOT the Selfridges+ subscription button ("Add to bag - £10.00")
-ADD_TO_BAG_RE = re.compile(r"add to (?:bag|basket)(?!\s*[-\u2013\u2014]\s*[£$€])")
+ADD_TO_BAG_RE = re.compile(r"add to (?:bag|basket)(?!\s*[-–—]\s*[£$€])")
 
-PROBLEM_THRESHOLD = 20  # consecutive unreadable checks before warning you
-
-# Tuned for the "flashing in and out of stock for a few seconds" phase.
-CONFIRM_DELAY_SECONDS = 1.5
-LOOP_INTERVAL_MIN = 5
-LOOP_INTERVAL_MAX = 10
-REMINDER_DELAY_SECONDS = 20
+PROBLEM_THRESHOLD = 10  # consecutive unreadable checks before warning you
+CONFIRM_DELAY_SECONDS = 5  # second probe this many seconds later, before alerting
 
 
 def now_iso():
@@ -79,7 +78,7 @@ def send_telegram(message):
             if r.ok:
                 return True
             print(f"Telegram HTTP {r.status_code}: {r.text[:200]}")
-        except Exception as exc:  # network blip
+        except Exception as exc:
             print(f"Telegram error: {type(exc).__name__}")
         time.sleep(2)
     return False
@@ -107,15 +106,6 @@ def get(url, follow):
     return requests.get(url, headers=HEADERS, timeout=15, allow_redirects=follow)
 
 
-def fingerprint(html):
-    """Hash of the page with per-visit tokens/long ids stripped out."""
-    text = html.lower()
-    text = re.sub(r"[a-z0-9_\-\.%=&:/]{24,}", " ", text)
-    text = re.sub(r"\d{5,}", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
-
-
 def product_is_purchasable(html):
     lower = html.lower()
     if any(m in lower for m in OUT_OF_STOCK_MARKERS):
@@ -134,7 +124,6 @@ def probe():
         "queue_status": None,
         "queue_valid": False,
         "queue_pre": False,
-        "queue_hash": None,
         "restock_pending": False,
         "note": "",
     }
@@ -146,7 +135,6 @@ def probe():
         status = r.status_code
         loc = r.headers.get("Location", "")
         if status in REDIRECT_CODES and "queue-it" not in loc.lower():
-            # ordinary redirect (region/slug) - follow it fully
             r = get(PRODUCT_URL, follow=True)
             status = r.status_code
             loc = r.url if "queue-it" in r.url.lower() else ""
@@ -175,7 +163,6 @@ def probe():
                 lower = queue_html.lower()
                 info["queue_valid"] = ("queue-it" in lower) or ("queueit" in lower)
                 info["queue_pre"] = any(m in lower for m in PRE_QUEUE_MARKERS)
-                info["queue_hash"] = fingerprint(queue_html)
             else:
                 info["note"] = (info["note"] + f" queue status {q.status_code}").strip()
         except Exception as exc:
@@ -190,21 +177,15 @@ def probe():
 
 # ------------------------------------------------------------- classification
 def calibrate(state, info):
-    """First time we can read the queue page, decide how to detect 'open'."""
     if state.get("mode") or not info["queue_valid"]:
         return
     state["mode"] = "marker" if info["queue_pre"] else "fingerprint"
-    state["baseline_hash"] = info["queue_hash"]
     state["calibrated_at"] = now_iso()
 
 
 def classify(info, state):
     if info["product_live"]:
         return "PRODUCT_LIVE"
-    # Restock: we've previously seen the "unavailable, more stock coming soon"
-    # banner, and now it's gone with the page loading normally (not stuck in
-    # queue) - that's the moment to pounce, even if "Add to bag" text itself
-    # hasn't been matched yet (page layouts can vary at the exact restock instant).
     if (
         state.get("restock_ever_seen")
         and not info["restock_pending"]
@@ -212,12 +193,8 @@ def classify(info, state):
         and not info["to_queue"]
     ):
         return "RESTOCKED"
-    if info["queue_valid"]:
-        mode = state.get("mode")
-        if mode == "marker" and not info["queue_pre"]:
-            return "QUEUE_OPEN"
-        if mode == "fingerprint" and info["queue_hash"] != state.get("baseline_hash"):
-            return "QUEUE_OPEN"
+    if info["queue_valid"] and state.get("mode") == "marker" and not info["queue_pre"]:
+        return "QUEUE_OPEN"
     return "WAITING"
 
 
@@ -243,78 +220,38 @@ def track_problems(state, info):
 MESSAGES = {
     "QUEUE_OPEN": (
         "🚨🌸 THE FRAGRANCE HAUL QUEUE IS OPEN! 🚨\n\n"
-        f"Join now: {PRODUCT_URL}\n"
-        "(That link sends you straight into the Queue-it waiting room.)\n\n"
+        f"Join now: {PRODUCT_URL}\n\n"
         f"Backup: {QUEUE_URL}"
     ),
     "PRODUCT_LIVE": (
-        "🛒🌸 THE FRAGRANCE HAUL IS ON SALE (no queue detected)!\n\n"
+        "🛒🌸 THE FRAGRANCE HAUL IS ON SALE!\n\n"
         f"Buy now: {PRODUCT_URL}"
     ),
     "RESTOCKED": (
         "🔥🌸 STOCK MIGHT BE BACK on The Fragrance Haul! 🔥\n\n"
-        "The 'more stock coming soon' notice has disappeared.\n\n"
+        "The 'more stock coming soon' notice has cleared.\n\n"
         f"Go now: {PRODUCT_URL}\n"
         f"Queue link: {QUEUE_URL}\n\n"
-        "Move fast - it may sell out again in minutes, and this is a looser "
-        "signal than the others so double-check it's real when you click through."
+        "Double-check it's real when you click through - this signal is a little "
+        "looser than the others."
     ),
 }
 
 
-def maybe_send_armed(state, info):
-    if state.get("armed_sent") or not state.get("mode"):
-        return
-    if state["mode"] == "marker":
-        detail = (
-            "I can read the 'queue will open' message on the Queue-it page, so I'll alert "
-            "you the moment it disappears."
-        )
-    else:
-        detail = (
-            "I couldn't see the 'will open' text in the raw page, so I'm watching for ANY "
-            "change to the queue page instead (less precise, could occasionally false-alarm)."
-        )
-    restock_note = (
-        "It's currently showing the 'more stock coming soon' sold-out banner - "
-        "I'll alert you the moment that clears too."
-        if info["restock_pending"]
-        else "No sold-out banner detected right now."
-    )
-    send_telegram(
-        "👀 Fragrance Haul watcher armed.\n"
-        f"Product page redirects to queue: {'yes' if info['to_queue'] else 'no'}\n"
-        f"{detail}\n"
-        f"{restock_note}\n"
-        f"Checking roughly every {LOOP_INTERVAL_MIN}-{LOOP_INTERVAL_MAX} seconds "
-        "(tightened for the flash-restock phase)."
-    )
-    state["armed_sent"] = True
-
-
-def run_once(state, loop_mode):
+def run_once(state):
     info = probe()
     state["restock_ever_seen"] = state.get("restock_ever_seen", False) or info["restock_pending"]
     track_problems(state, info)
     calibrate(state, info)
-    if loop_mode:
-        maybe_send_armed(state, info)
 
     result = classify(info, state)
     if result != "WAITING":
-        # Confirm with a second probe shortly after, to avoid one-off render
-        # glitches. Kept short (not 0) because stock has been flashing in and
-        # out for seconds at a time - every second here is a second less to
-        # react, but an unconfirmed false alarm wastes a reaction too.
+        # confirm with a second probe before alerting, to avoid a one-off glitch
         time.sleep(CONFIRM_DELAY_SECONDS)
         info2 = probe()
+        state["restock_ever_seen"] = state.get("restock_ever_seen", False) or info2["restock_pending"]
         result2 = classify(info2, state)
-        noisy = (
-            result == "QUEUE_OPEN"
-            and state.get("mode") == "fingerprint"
-            and info["queue_hash"] != info2["queue_hash"]
-        )
-        if result2 != result or noisy:
+        if result2 != result:
             result = "WAITING"
 
     print(
@@ -328,39 +265,33 @@ def run_once(state, loop_mode):
     if result != "WAITING" and result not in state["alerted"]:
         send_telegram(MESSAGES[result])
         state["alerted"][result] = now_iso()
-        save_state(state)
-        if loop_mode:
-            for i in (1, 2):
-                time.sleep(REMINDER_DELAY_SECONDS)
-                send_telegram(f"🔔 Reminder {i}/2: {MESSAGES[result]}")
     return result
 
 
 def main():
-    try:
-        loop_minutes = min(float(os.environ.get("LOOP_MINUTES", "0") or 0), 350)
-    except ValueError:
-        loop_minutes = 0
-
     if os.environ.get("SEND_TEST", "").lower() == "true":
         ok = send_telegram("✅ Test message from your Selfridges fragrance watcher.")
         print("Test message sent." if ok else "Test message FAILED.")
 
-    state = load_state()
-
-    if loop_minutes <= 0:
-        run_once(state, loop_mode=False)
-        save_state(state)
+    now = datetime.now(timezone.utc)
+    if now > WATCH_UNTIL:
+        state = load_state()
+        if not state.get("expiry_notice_sent"):
+            send_telegram(
+                "⏰ The Fragrance Haul watch window has ended (3 weeks elapsed) "
+                "with no confirmed restock detected by this watcher. "
+                "If you still want this, check the product page manually, or edit "
+                "WATCH_UNTIL in check_fragrance.py to extend the window.\n\n"
+                f"{PRODUCT_URL}"
+            )
+            state["expiry_notice_sent"] = True
+            save_state(state)
+        print(f"[{now_iso()}] watch window ended ({WATCH_UNTIL.date()}), skipping check.")
         return
 
-    end = time.time() + loop_minutes * 60
-    print(f"Loop mode: {loop_minutes:.0f} minutes")
-    while True:
-        run_once(state, loop_mode=True)
-        save_state(state)
-        if time.time() + 15 >= end:
-            break
-        time.sleep(random.uniform(LOOP_INTERVAL_MIN, LOOP_INTERVAL_MAX))
+    state = load_state()
+    run_once(state)
+    save_state(state)
 
 
 if __name__ == "__main__":
