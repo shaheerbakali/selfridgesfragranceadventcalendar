@@ -2,10 +2,10 @@ name: Check Selfridges FRAGRANCE Advent Calendar
 
 on:
   schedule:
-    # Baseline safety net: one check every 15 minutes, all the time.
-    # (GitHub's real minimum for cron is 5 minutes and runs can be delayed, so the
-    # launch-day second-by-second watching is handled by launch_loop.yml instead.)
-    - cron: "*/15 * * * *"
+    # Every 5 minutes (GitHub's real minimum for scheduled runs), running
+    # continuously. The script itself stops checking after a 3-week window
+    # (see WATCH_UNTIL in check_fragrance.py) and sends one final notice.
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       send_test:
@@ -36,16 +36,15 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: fragrance_state.json
-          key: fragrance-state-v3-${{ github.run_id }}
+          key: fragrance-state-v4-${{ github.run_id }}
           restore-keys: |
-            fragrance-state-v3-
+            fragrance-state-v4-
 
       - name: Run fragrance check
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SEND_TEST: ${{ inputs.send_test || 'false' }}
-          LOOP_MINUTES: "0"
         run: python check_fragrance.py
 
       - name: Save state
@@ -53,4 +52,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: fragrance_state.json
-          key: fragrance-state-v3-${{ github.run_id }}
+          key: fragrance-state-v4-${{ github.run_id }}
